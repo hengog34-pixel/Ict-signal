@@ -1,26 +1,58 @@
-# ICT Signal Tool - Streamlit web app
+# ICT Signal Tool v2 - Streamlit web app (with MA, RSI and a cleaner UI)
 # Educational only. Not financial advice. No profit is guaranteed.
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="ICT Signal Tool", layout="wide")
-st.title("ICT Signal Tool")
+st.set_page_config(page_title="ICT Signal Tool", page_icon="📈", layout="wide",
+                   initial_sidebar_state="collapsed")
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.2rem; padding-bottom: 2rem; max-width: 1100px;}
+.signal-card {border-radius: 16px; padding: 18px 20px; margin: 8px 0 14px 0; color: white;}
+.signal-long {background: linear-gradient(135deg, #0f9d58, #0b6e3f);}
+.signal-short {background: linear-gradient(135deg, #d93025, #9b1c14);}
+.signal-wait {background: linear-gradient(135deg, #5f6b7a, #3c4450);}
+.signal-title {font-size: 2rem; font-weight: 800; line-height: 1.1;}
+.signal-sub {opacity: 0.92; font-size: 0.95rem; margin-top: 6px;}
+</style>
+""", unsafe_allow_html=True)
+
+st.title("📈 ICT Signal Tool")
 st.caption("Educational only. Not financial advice. Test on a demo account first.")
 
-# ---------- Sidebar inputs ----------
-with st.sidebar:
-    st.header("Settings")
-    symbol = st.text_input("Symbol", "BTC-USD").strip().upper()
-    interval = st.selectbox("Interval", ["15m", "1h", "1d"], index=1)
-    period = st.selectbox("Period", ["5d", "30d", "60d", "6mo", "1y"], index=1)
-    swing_n = st.slider("Swing strength (bars each side)", 2, 6, 3)
-    fvg_lookback = st.slider("FVG lookback (bars)", 10, 80, 30)
-    sweep_lookback = st.slider("Sweep lookback (bars)", 5, 30, 10)
-    rr = st.slider("Risk:Reward", 1.0, 4.0, 2.0, 0.5)
-    st.caption("Examples: ETH-USD, EURUSD=X, GC=F (gold), AAPL, TSLA")
+
+def fmt(x):
+    return f"{x:,.2f}" if abs(x) >= 10 else f"{x:,.5f}"
+
+
+# ---------- Inputs (top of page, easy on phones) ----------
+c1, c2, c3 = st.columns([2, 1, 1])
+symbol = c1.text_input("Symbol", "BTC-USD").strip().upper()
+interval = c2.selectbox("Interval", ["15m", "1h", "1d"], index=1)
+period = c3.selectbox("Period", ["5d", "30d", "60d", "6mo", "1y"], index=1)
+st.caption("Examples: ETH-USD, EURUSD=X, GC=F (gold), AAPL, TSLA")
+
+with st.expander("⚙️ Advanced settings"):
+    a1, a2 = st.columns(2)
+    swing_n = a1.slider("Swing strength (bars each side)", 2, 6, 3)
+    fvg_lookback = a2.slider("FVG lookback (bars)", 10, 80, 30)
+    sweep_lookback = a1.slider("Sweep lookback (bars)", 5, 30, 10)
+    rr = a2.slider("Risk:Reward", 1.0, 4.0, 2.0, 0.5)
+    rsi_len = a1.slider("RSI length", 5, 30, 14)
+    show_ma = a2.checkbox("Show MA20 / MA50", True)
+    show_rsi = a2.checkbox("Show RSI panel", True)
+    candle_style = a1.selectbox("Candle style",
+                                ["TradingView (maroon/black)", "Classic (green/red)"])
+    bars_shown = a2.slider("Bars shown", 50, 500, 120, 10)
+    dark_chart = a1.checkbox("Dark chart", False)
+    if st.button("🔄 Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
 
 
 @st.cache_data(ttl=300)
@@ -35,13 +67,24 @@ def load_data(symbol, interval, period):
     return df
 
 
+def add_indicators(df, rsi_len):
+    df = df.copy()
+    df["MA20"] = df["Close"].rolling(20).mean()
+    df["MA50"] = df["Close"].rolling(50).mean()
+    delta = df["Close"].diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / rsi_len, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / rsi_len, adjust=False).mean()
+    rs = gain / loss
+    df["RSI"] = 100 - (100 / (1 + rs))
+    return df
+
+
 def analyze(df, n, fvg_lookback, sweep_lookback, rr):
     h = df["High"].values
     l = df["Low"].values
     c = df["Close"].values
     last = len(df) - 1
 
-    # Swing highs / lows
     swing_highs, swing_lows = [], []
     for i in range(n, len(df) - n):
         if h[i] == h[i - n:i + n + 1].max():
@@ -51,7 +94,6 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
     if len(swing_highs) < 2 or len(swing_lows) < 2:
         return None
 
-    # Market structure
     hh = swing_highs[-1][1] > swing_highs[-2][1]
     hl = swing_lows[-1][1] > swing_lows[-2][1]
     if hh and hl:
@@ -61,7 +103,6 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
     else:
         bias = "NEUTRAL"
 
-    # Liquidity sweeps
     bull_sweep = bear_sweep = False
     for j in range(max(0, len(df) - sweep_lookback), len(df)):
         for idx, price in swing_lows:
@@ -71,7 +112,6 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
             if idx < j - n and h[j] > price and c[j] < price:
                 bear_sweep = True
 
-    # Fair Value Gaps
     fvgs = []
     start = max(2, len(df) - fvg_lookback)
     for i in range(start, len(df)):
@@ -89,7 +129,6 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
     in_bear = any(t == "bear" and h[last] >= bottom and c[last] <= top
                   for t, _, bottom, top in fvgs)
 
-    # Score and signal
     score = 0
     score += 1 if bias == "BULLISH" else (-1 if bias == "BEARISH" else 0)
     score += 1 if bull_sweep else 0
@@ -115,39 +154,96 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
                 swing_highs=swing_highs, swing_lows=swing_lows)
 
 
-def make_chart(df, r, title):
+def make_chart(df, r, title, show_ma, show_rsi, candle_style, bars_shown, dark):
     last = len(df) - 1
-    fig = go.Figure()
+    rows = 2 if show_rsi else 1
+    fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
+                        row_heights=[0.72, 0.28] if show_rsi else [1.0],
+                        vertical_spacing=0.04)
+
+    if candle_style.startswith("TradingView"):
+        up_color = "#8b1a1a"
+        down_color = "#e5e5e5" if dark else "#111111"
+    else:
+        up_color, down_color = "#26a69a", "#ef5350"
+    fg = "#e5e5e5" if dark else "#111111"
+    grid = "#2a2f3a" if dark else "#e3e6ea"
+
     fig.add_trace(go.Candlestick(
         x=df["Time"], open=df["Open"], high=df["High"],
-        low=df["Low"], close=df["Close"], name="Price"))
+        low=df["Low"], close=df["Close"], name="Price",
+        increasing=dict(line=dict(color=up_color, width=1), fillcolor=up_color),
+        decreasing=dict(line=dict(color=down_color, width=1), fillcolor=down_color)),
+        row=1, col=1)
+
+    # Dotted line + label at the last price (like TradingView)
+    last_close = df["Close"].iloc[-1]
+    fig.add_hline(y=last_close, line_dash="dot", line_color=fg, line_width=1,
+                  annotation_text=fmt(last_close), annotation_position="top right",
+                  row=1, col=1)
+
+    if show_ma:
+        fig.add_trace(go.Scatter(x=df["Time"], y=df["MA20"], name="MA20",
+                                 line=dict(color="orange", width=1.5)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df["Time"], y=df["MA50"], name="MA50",
+                                 line=dict(color="#4da3ff", width=1.5)), row=1, col=1)
+
     fig.add_trace(go.Scatter(
         x=[df["Time"][i] for i, _ in r["swing_highs"]],
         y=[p for _, p in r["swing_highs"]], mode="markers", name="Swing High",
-        marker=dict(symbol="triangle-down", color="red", size=9)))
+        marker=dict(symbol="triangle-down", color="red", size=9)), row=1, col=1)
     fig.add_trace(go.Scatter(
         x=[df["Time"][i] for i, _ in r["swing_lows"]],
         y=[p for _, p in r["swing_lows"]], mode="markers", name="Swing Low",
-        marker=dict(symbol="triangle-up", color="green", size=9)))
+        marker=dict(symbol="triangle-up", color="#2ecc71", size=9)), row=1, col=1)
+
     for t, i, bottom, top in r["fvgs"]:
         fig.add_shape(
             type="rect", x0=df["Time"][i], x1=df["Time"][last],
-            y0=bottom, y1=top, line_width=0,
-            fillcolor="rgba(0,180,0,0.25)" if t == "bull" else "rgba(220,0,0,0.25)")
+            y0=bottom, y1=top, line_width=0, row=1, col=1,
+            fillcolor="rgba(0,200,0,0.25)" if t == "bull" else "rgba(230,0,0,0.25)")
+
     if r["signal"] != "WAIT":
         for name, price, color in [("Entry", r["entry"], "gray"),
                                    ("Stop", r["stop"], "red"),
-                                   ("Target", r["target"], "green")]:
+                                   ("Target", r["target"], "#2ecc71")]:
             fig.add_hline(y=price, line_dash="dash", line_color=color,
-                          annotation_text=name)
-    fig.update_layout(title=title, xaxis_rangeslider_visible=False,
-                      height=600, margin=dict(l=10, r=10, t=50, b=10))
+                          annotation_text=name, row=1, col=1)
+
+    if show_rsi:
+        fig.add_trace(go.Scatter(x=df["Time"], y=df["RSI"], name="RSI",
+                                 line=dict(color="#b388ff", width=1.5)), row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+        fig.add_hline(y=30, line_dash="dash", line_color="#2ecc71", row=2, col=1)
+        fig.update_yaxes(range=[0, 100], row=2, col=1)
+
+    # Zoom to the last N bars so candles are big and easy to read
+    start = max(0, len(df) - bars_shown)
+    vis = df.iloc[start:]
+    ymin, ymax = vis["Low"].min(), vis["High"].max()
+    pad = (ymax - ymin) * 0.08 or ymax * 0.001
+    fig.update_yaxes(range=[ymin - pad, ymax + pad], row=1, col=1)
+    if len(df) > 1:
+        step = df["Time"].iloc[-1] - df["Time"].iloc[-2]
+        fig.update_xaxes(range=[df["Time"].iloc[start],
+                                df["Time"].iloc[-1] + step * 6])
+
+    fig.update_xaxes(rangeslider_visible=False, showgrid=True,
+                     gridcolor=grid, griddash="dot")
+    fig.update_yaxes(side="right", showgrid=True, gridcolor=grid, griddash="dot")
+
+    fig.update_layout(
+        title=title, template="plotly_dark" if dark else "plotly_white",
+        dragmode="pan",
+        height=760 if show_rsi else 600,
+        margin=dict(l=10, r=10, t=60, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0))
     return fig
 
 
 # ---------- Main page ----------
 if not symbol:
-    st.info("Enter a symbol in the sidebar.")
+    st.info("Enter a symbol above.")
     st.stop()
 
 df = load_data(symbol, interval, period)
@@ -156,30 +252,80 @@ if df.empty:
              "(15m data only works up to 60 days).")
     st.stop()
 
+df = add_indicators(df, rsi_len)
 result = analyze(df, swing_n, fvg_lookback, sweep_lookback, rr)
 if result is None:
     st.warning("Not enough data to find swings. Try a longer period.")
     st.stop()
 
-# Signal summary
-c1, c2, c3 = st.columns(3)
-c1.metric("Signal", result["signal"])
-c2.metric("Market structure", result["bias"])
-c3.metric("Score", result["score"])
+last_row = df.iloc[-1]
+prev_close = df["Close"].iloc[-2] if len(df) > 1 else last_row["Close"]
+change = (last_row["Close"] / prev_close - 1) * 100
 
-if result["signal"] != "WAIT":
-    d1, d2, d3 = st.columns(3)
-    d1.metric("Entry", round(result["entry"], 2))
-    d2.metric("Stop loss", round(result["stop"], 2))
-    d3.metric("Take profit", round(result["target"], 2))
+# Signal card
+sig = result["signal"]
+cls = {"LONG": "signal-long", "SHORT": "signal-short"}.get(sig, "signal-wait")
+icon = {"LONG": "🟢", "SHORT": "🔴"}.get(sig, "⚪")
+if sig == "WAIT":
+    sub = "No clear setup right now. WAIT is a normal result."
 else:
-    st.info("No clear setup right now. WAIT is a normal result.")
+    sub = ("Entry " + fmt(result["entry"]) + " · Stop " + fmt(result["stop"])
+           + " · Target " + fmt(result["target"]))
+st.markdown(
+    '<div class="signal-card ' + cls + '"><div class="signal-title">'
+    + icon + " " + sig + '</div><div class="signal-sub">'
+    + symbol + " · " + interval + " · " + sub + "</div></div>",
+    unsafe_allow_html=True)
 
-with st.expander("Why this signal?"):
-    st.write("Bullish sweep:", result["bull_sweep"],
-             "| Bearish sweep:", result["bear_sweep"])
-    st.write("Price in bullish FVG:", result["in_bull"],
-             "| in bearish FVG:", result["in_bear"])
+# Key numbers
+rsi_val = last_row["RSI"]
+if rsi_val > 70:
+    rsi_note = "Overbought"
+elif rsi_val < 30:
+    rsi_note = "Oversold"
+else:
+    rsi_note = "Neutral"
 
-fig = make_chart(df, result, symbol + " (" + interval + ") - " + result["signal"])
-st.plotly_chart(fig, use_container_width=True)
+if pd.notna(last_row["MA50"]):
+    trend = "Uptrend" if last_row["MA20"] > last_row["MA50"] else "Downtrend"
+else:
+    trend = "Not enough data"
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Price", fmt(last_row["Close"]), f"{change:+.2f}%")
+m2.metric("RSI", f"{rsi_val:.1f}", rsi_note, delta_color="off")
+m3.metric("MA trend", trend)
+m4.metric("Structure", result["bias"])
+
+# Tabs
+tab_chart, tab_detail, tab_help = st.tabs(["📊 Chart", "🔍 Signal details", "📘 Help"])
+
+with tab_chart:
+    fig = make_chart(df, result, symbol + " (" + interval + ")", show_ma, show_rsi,
+                     candle_style, bars_shown, dark_chart)
+    st.plotly_chart(fig, use_container_width=True,
+                    config={"displaylogo": False, "scrollZoom": True})
+
+with tab_detail:
+    def mark(flag):
+        return "✅" if flag else "❌"
+    st.write("**Score:**", result["score"], "(LONG at +2 or more, SHORT at -2 or less)")
+    st.write("Market structure:", result["bias"])
+    st.write(mark(result["bull_sweep"]), "Bullish liquidity sweep")
+    st.write(mark(result["bear_sweep"]), "Bearish liquidity sweep")
+    st.write(mark(result["in_bull"]), "Price inside bullish FVG")
+    st.write(mark(result["in_bear"]), "Price inside bearish FVG")
+    st.write("MA20:", fmt(last_row["MA20"]) if pd.notna(last_row["MA20"]) else "n/a",
+             "| MA50:", fmt(last_row["MA50"]) if pd.notna(last_row["MA50"]) else "n/a")
+
+with tab_help:
+    st.markdown("""
+- **Market structure**: higher highs and higher lows is bullish, lower highs and lower lows is bearish.
+- **Liquidity sweep**: price wicks past an old swing high or low, then closes back inside.
+- **FVG (Fair Value Gap)**: a gap between candle 1 and candle 3 that price often returns to.
+- **MA20 / MA50**: moving averages. MA20 above MA50 usually means an uptrend.
+- **RSI**: above 70 is overbought, below 30 is oversold.
+- **Chart tip**: drag to move, pinch to zoom, tap the home icon to reset.
+
+This tool is for learning only. Signals are not guaranteed and are not advice.
+""")
