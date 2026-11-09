@@ -64,6 +64,8 @@ def load_data(symbol, interval, period):
     df = df.dropna().reset_index()
     if len(df) > 0:
         df = df.rename(columns={df.columns[0]: "Time"})
+        if interval != "1d":
+            df["Time"] = pd.to_datetime(df["Time"], utc=True)
     return df
 
 
@@ -154,7 +156,101 @@ def analyze(df, n, fvg_lookback, sweep_lookback, rr):
                 swing_highs=swing_highs, swing_lows=swing_lows)
 
 
-def make_chart(df, r, title, show_ma, show_rsi, candle_style, bars_shown, dark):
+SESSIONS = [(0, 8, "ASIA"), (8, 13, "LONDON"), (13, 21, "NEW YORK")]  # UTC hours
+
+
+def session_name(hour):
+    for a, b, name in SESSIONS:
+        if a <= hour < b:
+            return name
+    return "LATE"
+
+
+def ict_extras(df, r, interval, rr):
+    """Session levels, 6-point checklist, grade and final signal (times are UTC)."""
+    if interval == "1d" or len(df) < 20:
+        return None
+    t = df["Time"]
+    day = t.dt.date
+    today = day.iloc[-1]
+    today_df = df[day == today]
+
+    levels = {"Open": today_df["Open"].iloc[0]}
+    asia = today_df[today_df["Time"].dt.hour < 8]
+    if len(asia):
+        levels["Asia H"] = asia["High"].max()
+        levels["Asia L"] = asia["Low"].min()
+    prev_days = sorted(set(day) - {today})
+    if prev_days:
+        prev_df = df[day == prev_days[-1]]
+        levels["PDH"] = prev_df["High"].max()
+        levels["PDL"] = prev_df["Low"].min()
+
+    # Did price sweep a session / previous-day level recently?
+    recent = df.tail(10)
+    bear_level = any(((recent["High"] > levels[k]) & (recent["Close"] < levels[k])).any()
+                     for k in ("Asia H", "PDH") if k in levels)
+    bull_level = any(((recent["Low"] < levels[k]) & (recent["Close"] > levels[k])).any()
+                     for k in ("Asia L", "PDL") if k in levels)
+
+    hour = t.iloc[-1].hour
+    killzone = (7 <= hour < 10) or (12 <= hour < 15)
+    ma_ok = bool(pd.notna(df["MA50"].iloc[-1]))
+    ma_up = ma_ok and bool(df["MA20"].iloc[-1] > df["MA50"].iloc[-1])
+    ma_down = ma_ok and bool(df["MA20"].iloc[-1] < df["MA50"].iloc[-1])
+
+    bull_list = [("Structure bullish", r["bias"] == "BULLISH"),
+                 ("Swing liquidity sweep (low)", r["bull_sweep"]),
+                 ("Price inside bullish FVG", r["in_bull"]),
+                 ("Killzone (London / New York)", killzone),
+                 ("Asia low / PDL swept", bull_level),
+                 ("MA20 above MA50", ma_up)]
+    bear_list = [("Structure bearish", r["bias"] == "BEARISH"),
+                 ("Swing liquidity sweep (high)", r["bear_sweep"]),
+                 ("Price inside bearish FVG", r["in_bear"]),
+                 ("Killzone (London / New York)", killzone),
+                 ("Asia high / PDH swept", bear_level),
+                 ("MA20 below MA50", ma_down)]
+    nb = sum(1 for _, ok in bull_list if ok)
+    ns = sum(1 for _, ok in bear_list if ok)
+    lean = "BUY" if nb > ns else ("SELL" if ns > nb else None)
+    checks = max(nb, ns)
+    grade = "A+" if checks >= 5 else ("B" if checks == 4 else ("C" if checks == 3 else "D"))
+
+    # Final signal: needs grade B or better and a valid stop
+    entry = df["Close"].iloc[-1]
+    signal, stop, target = "WAIT", None, None
+    if lean == "BUY" and checks >= 4:
+        stop = r["swing_lows"][-1][1] * 0.999
+        if entry > stop:
+            signal, target = "LONG", entry + rr * (entry - stop)
+    elif lean == "SELL" and checks >= 4:
+        stop = r["swing_highs"][-1][1] * 1.001
+        if entry < stop:
+            signal, target = "SHORT", entry - rr * (stop - entry)
+    if signal == "WAIT":
+        stop = None
+
+    # Sideways or trending (last 40 bars)
+    w = df.tail(40)
+    rng = w["High"].max() - w["Low"].min()
+    net = abs(w["Close"].iloc[-1] - w["Close"].iloc[0])
+    if rng and net / rng < 0.35:
+        state = "SIDEWAYS"
+    else:
+        state = "TRENDING UP" if w["Close"].iloc[-1] > w["Close"].iloc[0] else "TRENDING DOWN"
+
+    name = session_name(hour)
+    label = "ASIA BUILD" if name == "ASIA" else name + (" KILLZONE" if killzone else "")
+    return dict(levels=levels, lean=lean, checks=checks, grade=grade,
+                score=round(checks / 6 * 100), signal=signal, entry=entry,
+                stop=stop, target=target, state=state, session_label=label,
+                check_list=bear_list if lean == "SELL" else bull_list,
+                lean_text={"BUY": "BUY", "SELL": "SELL"}.get(lean, "BUY (tie, no lean)"))
+
+
+def make_chart(df, r, title, show_ma, show_rsi, candle_style, bars_shown, dark,
+               levels=None):
     last = len(df) - 1
     rows = 2 if show_rsi else 1
     fig = make_subplots(rows=rows, cols=1, shared_xaxes=True,
@@ -181,6 +277,15 @@ def make_chart(df, r, title, show_ma, show_rsi, candle_style, bars_shown, dark):
     fig.add_hline(y=last_close, line_dash="dot", line_color=fg, line_width=1,
                   annotation_text=fmt(last_close), annotation_position="top right",
                   row=1, col=1)
+
+    if levels:
+        level_colors = {"Open": fg, "Asia H": "#1e88e5", "Asia L": "#1e88e5",
+                        "PDH": "#f9a825", "PDL": "#f9a825"}
+        for lv_name, lv_price in levels.items():
+            fig.add_hline(y=lv_price, line_dash="dot", line_width=1,
+                          line_color=level_colors.get(lv_name, fg),
+                          annotation_text=lv_name, annotation_position="top left",
+                          row=1, col=1)
 
     if show_ma:
         fig.add_trace(go.Scatter(x=df["Time"], y=df["MA20"], name="MA20",
@@ -258,9 +363,36 @@ if result is None:
     st.warning("Not enough data to find swings. Try a longer period.")
     st.stop()
 
+ext = ict_extras(df, result, interval, rr)
+if ext:
+    result.update(signal=ext["signal"], entry=ext["entry"],
+                  stop=ext["stop"], target=ext["target"])
+
 last_row = df.iloc[-1]
 prev_close = df["Close"].iloc[-2] if len(df) > 1 else last_row["Close"]
 change = (last_row["Close"] / prev_close - 1) * 100
+
+# Status strip (session, state, lean, grade, checklist count)
+if ext:
+    lean_txt = {"BUY": "BUY leads", "SELL": "SELL leads"}.get(ext["lean"], "No lean")
+    if ext["signal"] == "WAIT":
+        note = "HELD · " + ext["state"].lower() + (" — no A+" if ext["grade"] != "A+" else "")
+    else:
+        note = "ACTIVE · " + ext["signal"] + " · grade " + ext["grade"]
+    st.markdown(
+        "<style>"
+        ".zq-strip{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0;}"
+        ".zq-chip{border:1px solid rgba(128,128,128,.45);border-radius:10px;padding:4px 10px;font-weight:700;font-size:.85rem;letter-spacing:.03em;}"
+        ".zq-gold{background:#f5c542;color:#1b1b1b;border-color:#f5c542;}"
+        ".zq-note{background:rgba(245,197,66,.15);border-left:4px solid #f5c542;padding:6px 10px;border-radius:6px;font-size:.9rem;margin-bottom:8px;}"
+        "</style>"
+        "<div class='zq-strip'>"
+        "<span class='zq-chip zq-gold'>" + ext["session_label"] + "</span>"
+        "<span class='zq-chip'>" + ext["state"] + "</span>"
+        "<span class='zq-chip'>" + ext["signal"] + " | " + lean_txt + " · " + ext["grade"] + " · " + str(ext["score"]) + "</span>"
+        "<span class='zq-chip'>" + str(ext["checks"]) + "/6</span>"
+        "</div><div class='zq-note'>" + note + " · times in UTC</div>",
+        unsafe_allow_html=True)
 
 # Signal card
 sig = result["signal"]
@@ -302,13 +434,21 @@ tab_chart, tab_detail, tab_help = st.tabs(["📊 Chart", "🔍 Signal details", 
 
 with tab_chart:
     fig = make_chart(df, result, symbol + " (" + interval + ")", show_ma, show_rsi,
-                     candle_style, bars_shown, dark_chart)
+                     candle_style, bars_shown, dark_chart,
+                     ext["levels"] if ext else None)
     st.plotly_chart(fig, use_container_width=True,
                     config={"displaylogo": False, "scrollZoom": True})
 
 with tab_detail:
     def mark(flag):
         return "✅" if flag else "❌"
+    if ext:
+        st.write("**ICT checklist:**", ext["checks"], "/ 6 for the", ext["lean_text"],
+                 "side | Grade:", ext["grade"])
+        for label, ok in ext["check_list"]:
+            st.write(mark(ok), label)
+        st.write("Levels:", {k: round(float(v), 2) for k, v in ext["levels"].items()})
+        st.divider()
     st.write("**Score:**", result["score"], "(LONG at +2 or more, SHORT at -2 or less)")
     st.write("Market structure:", result["bias"])
     st.write(mark(result["bull_sweep"]), "Bullish liquidity sweep")
